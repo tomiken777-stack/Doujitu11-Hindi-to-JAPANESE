@@ -1,0 +1,47 @@
+// =====================================
+// ★ 無料お試し（15回）管理
+// - 日本語→相手語（押して話す）で final が確定した時だけ消費
+// =====================================
+@MainActor final class TrialStore: ObservableObject {
+    static let maxFreeUses = 15
+
+    private let usedKey = "Dujitu11_trialUsedCount_v1"
+    private let lastSigKey = "Dujitu11_trialLastSignature_v1"
+
+    @Published private(set) var usedCount: Int
+    @Published private(set) var remainingUses: Int
+
+    init() {
+        let usedRaw = UserDefaults.standard.integer(forKey: usedKey)
+        let used = max(0, usedRaw)
+        let remaining = max(0, Self.maxFreeUses - used)
+
+        // ★ self.usedCount を参照しないで、ローカル値から両方初期化
+        self.usedCount = used
+        self.remainingUses = remaining
+    }
+
+    var hasTrial: Bool { remainingUses > 0 }
+
+    /// 同じ signature を二重消費しない（安全策）
+    func consumeOnce(signature: String) -> Bool {
+        let sig = signature.trimmingCharacters(in: .whitespacesAndNewlines)
+        if sig.isEmpty { return true }
+
+        if let last = UserDefaults.standard.string(forKey: lastSigKey), last == sig {
+            // 同一翻訳の二重呼び出しは消費しない
+            return true
+        }
+
+        guard remainingUses > 0 else {
+            return false
+        }
+
+        usedCount += 1
+        remainingUses = max(0, Self.maxFreeUses - usedCount)
+
+        UserDefaults.standard.set(usedCount, forKey: usedKey)
+        UserDefaults.standard.set(sig, forKey: lastSigKey)
+        return true
+    }
+}
