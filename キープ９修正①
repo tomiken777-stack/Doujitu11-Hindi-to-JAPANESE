@@ -1,0 +1,2089 @@
+import SwiftUI
+import AVFoundation
+import Speech
+import Accelerate
+import Combine   // ← 追加（ObservableObject / @Published 用）
+import StoreKit  // ← サブスク用
+
+#if canImport(Translation)
+import Translation
+#endif
+
+// =====================================
+// 共通コンフィグ（言語・IDなどをここで切り替え）
+// =====================================
+struct DoujituConfig {
+    // 表示名
+    let appDisplayName: String
+
+    // StoreKit
+    let subscriptionProductID: String
+
+    // プライバシーポリシー
+    let privacyPolicyURL: URL
+
+    // 翻訳言語コード（Translation.framework 用）
+    let userLangCode: String      // 例: "ja"
+    let partnerLangCode: String   // 例: "hi"
+
+    // ASR ロケール
+    let userASRLocale: String     // 例: "ja-JP"
+    let partnerASRLocale: String  // 例: "hi-IN"
+
+    // TTS 用言語コード
+    let partnerTTSLocale: String  // 例: "hi-IN"
+
+    // ログ保存関連
+    let logsFolderName: String
+    let logFilePrefix: String
+    let viToJaLogFilePrefix: String
+
+    // 追加データ同意用キー
+    let resourceConsentUserDefaultsKey: String
+}
+
+// ★ ここを書き換えるだけで、別言語版を作れる
+let appConfig = DoujituConfig(
+    appDisplayName: "Dujitu11",
+    subscriptionProductID: "Dujitu11_monthly",
+    privacyPolicyURL: URL(string: "https://your-privacy-policy-url.example.com")!,
+    userLangCode: "ja",
+    partnerLangCode: "hi",
+    userASRLocale: "ja-JP",
+    partnerASRLocale: "hi-IN",
+    partnerTTSLocale: "hi-IN",
+    logsFolderName: "Dujitu11Logs",
+    logFilePrefix: "dujitu11",
+    viToJaLogFilePrefix: "dujitu11_HItoJA",
+    resourceConsentUserDefaultsKey: "Dujitu11_ResourceDownloadConsent_v1"
+)
+
+// =====================================
+// お試し回数（15回）管理
+// =====================================
+@MainActor
+final class TrialUsageStore: ObservableObject {
+    private let limit: Int
+    private let usedKey: String
+
+    @Published private(set) var used: Int
+    @Published private(set) var remaining: Int
+
+    /// サブスクでアンロックされたら true（= 以降カウントしない）
+    @Published var isUnlocked: Bool = false
+
+    init(limit: Int = 15, usedKey: String = "Dujitu11_trial_used_v1") {
+        self.limit = limit
+        self.usedKey = usedKey
+
+        // ✅ self初期化順エラー回避：ローカル変数で計算→代入
+        let saved = UserDefaults.standard.integer(forKey: usedKey)
+        let initialUsed = max(0, saved)
+        let initialRemaining = max(0, limit - initialUsed)
+
+        self.used = initialUsed
+        self.remaining = initialRemaining
+    }
+
+    var canUseTranslation: Bool { isUnlocked || remaining > 0 }
+    var isExhausted: Bool { !isUnlocked && remaining <= 0 }
+
+    /// 翻訳が「成功したとき」にだけ呼ぶ（final未確定でカウントしない）
+    func consumeOneIfNeeded() -> Bool {
+        if isUnlocked { return true }
+        guard remaining > 0 else { return false }
+
+        used += 1
+        UserDefaults.standard.set(used, forKey: usedKey)
+        remaining = max(0, limit - used)
+        return true
+    }
+}
+
+// =====================================
+// Subscription (StoreKit2) for Dujitu11
+// =====================================
+@MainActor
+final class SubscriptionStore: ObservableObject {
+    @Published var product: Product?
+    @Published var isSubscribed: Bool = false
+    @Published var isLoading: Bool = false
+    @Published var errorMessage: String?
+
+    /// ★ 購読状態のチェックが完了したかどうか
+    @Published var hasCheckedSubscriptionStatus: Bool = false
+
+    /// App Store Connect で作成したサブスクリプションID
+    /// ★ 必ず App Store Connect 上の Product ID と一致させる
+    private let productID: String
+
+    init(config: DoujituConfig) {
+        self.productID = config.subscriptionProductID
+        Task {
+            await refresh()
+            await observeTransactions()
+        }
+    }
+
+    /// 商品情報読み込み & 購読状態更新
+    func refresh() async {
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            let products = try await Product.products(for: [productID])
+            if let first = products.first {
+                product = first
+                errorMessage = nil
+            } else {
+                product = nil
+                errorMessage = "現在サブスクリプション情報を取得できませんでした。しばらくしてからもう一度お試しください。"
+            }
+            await updateSubscriptionStatus()
+        } catch {
+            product = nil
+            errorMessage = "サブスクリプション情報の取得に失敗しました。通信環境やApp Storeの設定をご確認のうえ、時間をおいてもう一度お試しください。"
+            print("Failed to load products: \(error)")
+            await updateSubscriptionStatus()
+        }
+    }
+
+    /// 購入処理（7日間無料トライアルは App Store Connect 側で設定）
+    func purchase() async {
+        guard let product else {
+            errorMessage = "サブスクリプション情報が読み込まれていません。しばらくしてからもう一度お試しください。"
+            return
+        }
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            let result = try await product.purchase()
+            switch result {
+            case .success(let verification):
+                let transaction = try checkVerified(verification)
+                await updateSubscriptionStatus()
+                await transaction.finish()
+                errorMessage = nil
+            case .userCancelled:
+                break
+            case .pending:
+                errorMessage = "購入処理が保留されています。しばらくしてからもう一度お試しください。"
+            default:
+                break
+            }
+        } catch {
+            errorMessage = "購入に失敗しました。しばらくしてからもう一度お試しください。"
+            print("Purchase error: \(error)")
+        }
+    }
+
+    /// 購入の復元
+    func restore() async {
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            var found = false
+            for await result in Transaction.currentEntitlements {
+                let transaction = try checkVerified(result)
+                if transaction.productID == productID,
+                   transaction.revocationDate == nil,
+                   !transaction.isUpgraded {
+                    found = true
+                    isSubscribed = true
+                    break
+                }
+            }
+            hasCheckedSubscriptionStatus = true
+
+            if !found {
+                errorMessage = "有効なサブスクリプションが見つかりませんでした。"
+            } else {
+                errorMessage = nil
+            }
+        } catch {
+            errorMessage = "購入履歴の復元に失敗しました。通信環境をご確認のうえ、もう一度お試しください。"
+            print("Restore error: \(error)")
+        }
+    }
+
+    /// トランザクション監視
+    func observeTransactions() async {
+        for await result in Transaction.updates {
+            do {
+                let transaction = try checkVerified(result)
+                if transaction.productID == productID {
+                    isSubscribed = (transaction.revocationDate == nil && !transaction.isUpgraded)
+                    hasCheckedSubscriptionStatus = true
+                }
+                await transaction.finish()
+            } catch {
+                print("Transaction update verification failed: \(error)")
+            }
+        }
+    }
+
+    /// 現在の購読状態を更新
+    func updateSubscriptionStatus() async {
+        var active = false
+        for await result in Transaction.currentEntitlements {
+            do {
+                let transaction = try checkVerified(result)
+                if transaction.productID == productID,
+                   transaction.revocationDate == nil,
+                   !transaction.isUpgraded {
+                    active = true
+                    break
+                }
+            } catch {
+                print("updateSubscriptionStatus verification failed: \(error)")
+            }
+        }
+        isSubscribed = active
+        hasCheckedSubscriptionStatus = true
+    }
+
+    /// StoreKit 署名検証
+    private func checkVerified<T>(_ result: VerificationResult<T>) throws -> T {
+        switch result {
+        case .unverified(_, let error):
+            throw error
+        case .verified(let signedType):
+            return signedType
+        }
+    }
+}
+
+// =====================================
+// サブスク画面 View
+// =====================================
+struct SubscriptionView: View {
+    @EnvironmentObject private var subscriptionStore: SubscriptionStore
+    @EnvironmentObject private var trialStore: TrialUsageStore
+
+    // Apple 標準 EULA
+    private let eulaURL = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                Spacer(minLength: 20)
+
+                // タイトル & キャッチコピー
+                VStack(spacing: 8) {
+                    Text(appConfig.appDisplayName)
+                        .font(.system(size: 28, weight: .heavy, design: .rounded))
+                        .tracking(1.5)
+
+                    Text("日本語でそのまま話そう！")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+
+                    Text("あなたは日本語で話すだけ！相手のヒンディー語は自動で聞き取り、日本語の翻訳文字が表示され続ける通訳アプリです。")
+                        .font(.subheadline)
+                        .multilineTextAlignment(.center)
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal)
+
+                    if !subscriptionStore.isSubscribed {
+                        Text("お試し：残り \(trialStore.remaining) 回（合計15回）")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding()
+                .background(
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.pink.opacity(0.18),
+                                    Color.orange.opacity(0.15)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                )
+                .padding(.horizontal)
+
+                // 7日間無料トライアル 説明
+                VStack(spacing: 12) {
+                    Text("7日間無料トライアル")
+                        .font(.headline)
+
+                    Text(
+                        subscriptionStore.product?.displayPrice != nil
+                        ? "まずは7日間、すべての機能を無料でお試しいただけます。その後は自動的に \(subscriptionStore.product!.displayPrice) / 月 が適用されます。いつでもキャンセル可能です。"
+                        : "まずは7日間、すべての機能を無料でお試しいただけます。価格情報の取得中、または一時的に取得できない状態です。しばらくしてからもう一度お試しください。"
+                    )
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+                }
+
+                // 購読ボタン
+                VStack(spacing: 12) {
+                    Button {
+                        Task { await subscriptionStore.purchase() }
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Text(subscriptionStore.product?.displayPrice != nil
+                                 ? "7日間無料で試す（その後 \(subscriptionStore.product!.displayPrice)/月）"
+                                 : "7日間無料で試す")
+                                .fontWeight(.semibold)
+                                .padding(.vertical, 12)
+                            Spacer()
+                        }
+                        .background(
+                            LinearGradient(
+                                colors: [Color.pink, Color.orange],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .foregroundColor(.white)
+                        .cornerRadius(14)
+                        .shadow(radius: 3, y: 2)
+                    }
+                    .disabled(subscriptionStore.isLoading)
+
+                    Button {
+                        Task { await subscriptionStore.restore() }
+                    } label: {
+                        Text("購入を復元")
+                            .font(.subheadline)
+                    }
+                    .padding(.top, 4)
+
+                    if let err = subscriptionStore.errorMessage, !err.isEmpty {
+                        Text(err)
+                            .font(.footnote)
+                            .foregroundColor(.red)
+                            .multilineTextAlignment(.center)
+                            .padding(.top, 4)
+                            .padding(.horizontal)
+                    }
+                }
+                .padding(.horizontal)
+
+                Spacer()
+
+                // プライバシーポリシー / EULA
+                HStack(spacing: 16) {
+                    Link("プライバシーポリシー", destination: appConfig.privacyPolicyURL)
+                    Link("EULA（利用規約）", destination: eulaURL)
+                }
+                .font(.footnote)
+                .padding(.bottom, 12)
+            }
+            .navigationTitle("サブスクリプション")
+            .toolbar {
+                if subscriptionStore.isLoading {
+                    ProgressView()
+                }
+            }
+            .task {
+                await subscriptionStore.refresh()
+            }
+        }
+    }
+}
+
+// =====================================
+// RootView（サブスク状態＋お試し回数で切り替え）
+// =====================================
+struct RootView: View {
+    @EnvironmentObject private var subscriptionStore: SubscriptionStore
+    @EnvironmentObject private var trialStore: TrialUsageStore
+
+    var body: some View {
+        Group {
+            if !subscriptionStore.hasCheckedSubscriptionStatus {
+                SubscriptionView()
+            } else if subscriptionStore.isSubscribed {
+                ContentView(trialStore: trialStore)
+            } else {
+                if trialStore.canUseTranslation {
+                    ContentView(trialStore: trialStore)
+                } else {
+                    SubscriptionView()
+                }
+            }
+        }
+        .animation(.easeInOut, value: subscriptionStore.isSubscribed)
+        .onAppear {
+            trialStore.isUnlocked = subscriptionStore.isSubscribed
+        }
+        // ✅ iOS17 推奨：old,new か 0引数
+        .onChange(of: subscriptionStore.isSubscribed) { _, newValue in
+            trialStore.isUnlocked = newValue
+        }
+    }
+}
+
+// =====================================
+// App
+// =====================================
+@main
+struct Dujitu11App: App {
+    @StateObject private var subscriptionStore = SubscriptionStore(config: appConfig)
+    @StateObject private var trialStore = TrialUsageStore(limit: 15, usedKey: "Dujitu11_trial_used_v1")
+
+    var body: some Scene {
+        WindowGroup {
+            RootView()
+                .environmentObject(subscriptionStore)
+                .environmentObject(trialStore)
+        }
+    }
+}
+
+// =====================================
+// ASR（連続認識／一時停止／1101リトライ付き）
+// ヒンディー語・日本語兼用
+// =====================================
+final class ASRService: NSObject {
+    private let recognizer: SFSpeechRecognizer?
+    private let audioEngine = AVAudioEngine()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+
+    /// 48kHz などを指定できる
+    private let preferredSampleRate: Double
+
+    private(set) var didEmitFinal = false
+    private var onPartialHandler: ((String)->Void)?
+    private var onFinalHandler: ((String)->Void)?
+
+    private var retryCount = 0
+    private let maxRetry = 2
+    private var isStarting = false
+    private var paused = false
+
+    private var inputTapInstalled = false
+
+    init(localeIdentifier: String, preferredSampleRate: Double = 44_100) {
+        self.recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier))
+        self.preferredSampleRate = preferredSampleRate
+        super.init()
+    }
+
+    @MainActor
+    func requestAuthorization() async throws {
+        let status = await withCheckedContinuation { (cont: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
+            SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0) }
+        }
+        guard status == .authorized else {
+            throw NSError(domain: "ASR", code: 1, userInfo: [NSLocalizedDescriptionKey: "音声認識の権限がありません"])
+        }
+    }
+
+    @MainActor
+    func startContinuous(onPartial: @escaping (String)->Void,
+                         onFinal: @escaping (String)->Void) throws {
+        if isStarting { return }
+        isStarting = true
+        defer { isStarting = false }
+
+        paused = false
+        cancelAll()
+        didEmitFinal = false
+        retryCount = 0
+        onPartialHandler = onPartial
+        onFinalHandler = onFinal
+
+        try configureAndStartEngine()
+        startRecognitionTask()
+    }
+
+    @MainActor
+    func pause() {
+        paused = true
+        if inputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            inputTapInstalled = false
+        }
+    }
+
+    @MainActor
+    func resume(onPartial: @escaping (String)->Void,
+                onFinal: @escaping (String)->Void) {
+        guard paused else { return }
+        paused = false
+        onPartialHandler = onPartial
+        onFinalHandler = onFinal
+
+        if let req = self.request, audioEngine.isRunning {
+            installInputTap(using: req)
+            return
+        }
+        do {
+            try configureAndStartEngine()
+            startRecognitionTask()
+        } catch {
+            cancelAll()
+        }
+    }
+
+    @MainActor
+    func finishInput() {
+        if inputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            inputTapInstalled = false
+        }
+        if audioEngine.isRunning { audioEngine.stop() }
+        request?.endAudio()
+    }
+
+    @MainActor
+    func cancelAll() {
+        if inputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            inputTapInstalled = false
+        }
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        audioEngine.reset()
+        request?.endAudio()
+        task?.cancel()
+        task = nil
+        request = nil
+    }
+
+    @MainActor
+    private func installInputTap(using req: SFSpeechAudioBufferRecognitionRequest) {
+        guard !inputTapInstalled else { return }
+
+        let session = AVAudioSession.sharedInstance()
+        var sr = session.sampleRate
+        if sr <= 0 {
+            sr = preferredSampleRate > 0 ? preferredSampleRate : 44_100
+        }
+
+        guard let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                      sampleRate: sr,
+                                      channels: 1,
+                                      interleaved: false) else { return }
+
+        let input = audioEngine.inputNode
+        input.installTap(onBus: 0, bufferSize: 2048, format: fmt) { [weak req] buffer, _ in
+            req?.append(buffer)
+        }
+        inputTapInstalled = true
+    }
+
+    @MainActor
+    private func configureAndStartEngine() throws {
+        let session = AVAudioSession.sharedInstance()
+
+        // 一度確実に非アクティブにしてから再設定
+        try? session.setActive(false, options: [.notifyOthersOnDeactivation])
+
+        let targetSR = preferredSampleRate > 0 ? preferredSampleRate : 44_100
+
+        // マイク入力 + 出力を同時に使う
+        try session.setCategory(.playAndRecord,
+                                mode: .measurement,
+                                options: [.duckOthers, .defaultToSpeaker])
+
+        if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+            try? session.setPreferredInput(builtIn)
+        }
+        try? session.setPreferredInputNumberOfChannels(1)
+        try? session.setPreferredSampleRate(targetSR)
+        try? session.setPreferredIOBufferDuration(0.01)
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
+
+        var sr = session.sampleRate
+        if sr <= 0 { sr = targetSR }
+
+        // Recognition Request を作成
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        if #available(iOS 13.0, *), recognizer?.supportsOnDeviceRecognition == true {
+            req.requiresOnDeviceRecognition = true
+        }
+        self.request = req
+
+        // 先に Tap を仕込んでから start() する
+        installInputTap(using: req)
+
+        // いったんグラフをリセットしてから起動
+        audioEngine.reset()
+        audioEngine.prepare()
+        try audioEngine.start()
+    }
+
+    @MainActor
+    private func startRecognitionTask() {
+        guard let req = self.request else { return }
+
+        task = recognizer?.recognitionTask(with: req) { [weak self] result, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+
+                if let r = result {
+                    let text = r.bestTranscription.formattedString
+                    if r.isFinal {
+                        self.didEmitFinal = true
+                        self.onFinalHandler?(text)
+                    } else {
+                        self.onPartialHandler?(text)
+                    }
+                }
+
+                if let nsErr = error as NSError? {
+                    if nsErr.domain == "kAFAssistantErrorDomain",
+                       nsErr.code == 1101,
+                       self.retryCount < self.maxRetry,
+                       !self.paused {
+                        self.retryCount += 1
+                        let delay: UInt64 = self.retryCount == 1 ? 100_000_000 : 300_000_000
+                        self.softRestart(afterNsec: delay)
+                        return
+                    }
+                    self.cancelAll()
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func softRestart(afterNsec: UInt64) {
+        if inputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            inputTapInstalled = false
+        }
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        audioEngine.reset()
+        request?.endAudio()
+        task?.cancel()
+        task = nil
+        request = nil
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: afterNsec)
+            guard !self.paused else { return }
+            do {
+                try self.configureAndStartEngine()
+                self.startRecognitionTask()
+            } catch {
+                self.cancelAll()
+            }
+        }
+    }
+}
+
+// =====================================
+// TTS（相手言語）— 爆音固定版
+// =====================================
+@MainActor
+final class TTSSpeaker: NSObject, AVSpeechSynthesizerDelegate {
+    /// 将来の拡張用だが、今は常に最大音量 1.0
+    var boostDB: Float = 18.0
+
+    private let synth = AVSpeechSynthesizer()
+
+    @Published var isSpeaking = false
+
+    var onFinish: (() -> Void)?
+    private var didNotifyFinish = false
+    private var finishWaiters: [CheckedContinuation<Void, Never>] = []
+
+    override init() {
+        super.init()
+        synth.delegate = self
+    }
+
+    func stopImmediately() {
+        synth.stopSpeaking(at: .immediate)
+        isSpeaking = false
+        didNotifyFinish = false
+        resumeWaiters()
+    }
+
+    /// 日本語→相手言語訳文を読み上げる
+    func speakEnglish(_ text: String) {
+        // まず現在の発話を完全停止
+        stopImmediately()
+        didNotifyFinish = false
+
+        // ===== 爆音寄りオーディオセッション設定 =====
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback,
+                                 mode: .default,
+                                 options: [.duckOthers])
+        try? session.overrideOutputAudioPort(.speaker)
+        try? session.setActive(true, options: [.notifyOthersOnDeactivation])
+
+        // 発話設定（相手言語）
+        let u = AVSpeechUtterance(string: text)
+        u.voice = AVSpeechSynthesisVoice(language: appConfig.partnerTTSLocale)
+        u.rate = AVSpeechUtteranceDefaultSpeechRate
+        u.volume = 1.0   // 爆音
+
+        isSpeaking = true
+        synth.speak(u)
+    }
+
+    private func notifyFinishOnceWithDelay() {
+        guard !didNotifyFinish else { return }
+        didNotifyFinish = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3s
+            self.onFinish?()
+        }
+    }
+
+    func awaitFinish(timeout: TimeInterval = 25) async {
+        if !isSpeaking { return }
+        let timeoutNs = UInt64(max(0, timeout) * 1_000_000_000)
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.finishWaiters.append(cont)
+                    }
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutNs)
+            }
+            _ = await group.next()
+        }
+        if isSpeaking {
+            Task { @MainActor [weak self] in
+                self?.stopImmediately()
+            }
+        }
+    }
+
+    @MainActor
+    private func resumeWaiters() {
+        let waiters = finishWaiters
+        finishWaiters.removeAll()
+        for w in waiters { w.resume() }
+    }
+
+    // Delegate
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                                       didStart utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in self?.isSpeaking = true }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                                       didFinish utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isSpeaking = false
+            self.notifyFinishOnceWithDelay()
+            self.resumeWaiters()
+        }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                                       didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isSpeaking = false
+            self.resumeWaiters()
+        }
+    }
+}
+
+// =====================================
+// 会話ログモデル（ファイル管理用）
+// =====================================
+struct ConversationLog: Identifiable, Hashable {
+    let id: UUID
+    let url: URL      // URL型
+    let createdAt: Date
+
+    var displayName: String {
+        url.deletingPathExtension().lastPathComponent
+    }
+
+    var formattedDate: String {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "ja_JP")
+        df.dateFormat = "yyyy/MM/dd HH:mm"
+        return df.string(from: createdAt)
+    }
+}
+
+// =====================================
+// ViewModel（HI↔JA + ログ + ゴミ箱 + 15回お試し）
+// =====================================
+@MainActor
+final class DoujituVM: ObservableObject {
+    // 🔵 相手言語 → 日本語 側（常時）
+    @Published var enLivePartial: String = ""   // 実際は相手言語
+    @Published var enLiveFinal: String = ""     // 実際は相手言語最終
+    @Published var jaFromEN: String = ""        // 相手→JA 日本語訳
+    @Published var isENContinuousRunning = false
+
+    // 🔴 日本語 → 相手言語 側（押して話す）
+    @Published var partialJA: String = ""
+    @Published var finalJA:   String = ""
+    @Published var enFromJA:  String = ""       // JA→相手言語訳
+    @Published var isRecordingJA = false
+    @Published var isTranslating = false
+    @Published var errorMessage: String?
+
+    @Published var gainDB: Float = 18.0 {
+        didSet { tts.boostDB = gainDB }
+    }
+
+    /// 会話ログ保存 ON/OFF
+    @Published var isLoggingEnabled: Bool = true {
+        didSet {
+            if !isLoggingEnabled {
+                flushCurrentLogToFile()
+            }
+        }
+    }
+
+    /// 保存済みログ一覧（通常フォルダ）
+    @Published var savedLogs: [ConversationLog] = []
+
+    /// ゴミ箱内のログ一覧（Trash フォルダ）
+    @Published var trashedLogs: [ConversationLog] = []
+
+    // 🔵 相手言語ASR：精度優先で 48kHz
+    let asrEN = ASRService(localeIdentifier: appConfig.partnerASRLocale, preferredSampleRate: 48_000)
+    // 🔴 日本語ASR：44.1kHz
+    let asrJA = ASRService(localeIdentifier: appConfig.userASRLocale)
+    let tts = TTSSpeaker()
+
+    // ★ 15回お試しストア（UIから注入）
+    private let trialStore: TrialUsageStore
+
+#if canImport(Translation)
+// 日本語 → 相手言語（同意後に有効化するため、起動時は nil）
+@Published var tConfigJAtoEN: TranslationSession.Configuration? = nil
+// 相手言語 → 日本語（同意後に有効化するため、起動時は nil）
+@Published var tConfigENtoJA: TranslationSession.Configuration? = nil
+
+    private var sessionJAtoEN: TranslationSession?
+    private var sessionENtoJA: TranslationSession?
+
+    /// システム翻訳が利用できるか（言語ペア未対応や translationd クラッシュ時に false にする）
+    @Published var isSystemTranslationAvailable: Bool = true
+    #endif
+
+    private var enDebounceTask: Task<Void, Never>?
+    private var jaTranslateTask: Task<Void, Never>?
+
+    // 相手言語ASRの権限を一度だけ取るためのフラグ
+    private var enAuthorized = false
+
+    // ==== ログ保存用（5分単位） ====
+    private var currentLogStartDate: Date?
+    private var currentLogBuffer: String = ""
+    /// 相手語→日本語の「日本語訳だけ」をまとめるためのバッファ
+    private var enToJaOnlyBuffer: String = ""
+
+    private static let logTimeFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "ja_JP")
+        df.dateFormat = "yyyy/MM/dd HH:mm:ss"
+        return df
+    }()
+
+    // ★ 「finalじゃないのにカウントされる」対策：final確定分だけ消費
+    private var lastCountedPartnerFinal: String = ""
+    private var lastCountedJAFinal: String = ""
+
+    init(trialStore: TrialUsageStore) {
+        self.trialStore = trialStore
+        tts.boostDB = gainDB
+        // TTS完了後に相手語ストリーミングを再開
+        tts.onFinish = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.startENContinuous()
+            }
+        }
+        loadExistingLogs()
+    }
+
+    // =============================
+    // Translation セッションバインド（★ウォームアップ付き）
+    // =============================
+    #if canImport(Translation)
+    func enableTranslationTasks() {
+        guard isSystemTranslationAvailable else { return }
+
+        tConfigJAtoEN = .init(
+            source: .init(identifier: appConfig.userLangCode),
+            target: .init(identifier: appConfig.partnerLangCode)
+        )
+        tConfigENtoJA = .init(
+            source: .init(identifier: appConfig.partnerLangCode),
+            target: .init(identifier: appConfig.userLangCode)
+        )
+    }
+
+    func bindSessionJAtoEN(_ s: TranslationSession) async {
+        guard isSystemTranslationAvailable else { return }
+        sessionJAtoEN = s
+        do {
+            try await s.prepareTranslation()
+            _ = try? await s.translate("これは翻訳ウォームアップ用のテストです。")
+        } catch {
+            handleTranslationSetupError(error, direction: "JA→\(appConfig.partnerLangCode.uppercased())")
+            isSystemTranslationAvailable = false
+        }
+    }
+
+    func bindSessionENtoJA(_ s: TranslationSession) async {
+        guard isSystemTranslationAvailable else { return }
+        sessionENtoJA = s
+        do {
+            try await s.prepareTranslation()
+            _ = try? await s.translate("नमस्ते") // ヒンディー語のままでもOK（ウォームアップ）
+        } catch {
+            handleTranslationSetupError(error, direction: "\(appConfig.partnerLangCode.uppercased())→JA")
+            isSystemTranslationAvailable = false
+        }
+    }
+
+    private func handleTranslationSetupError(_ error: Error, direction: String) {
+        let nsErr = error as NSError
+        if nsErr.domain == "TranslationErrorDomain" || nsErr.code == 4097 {
+            errorMessage = "このデバイスではシステム翻訳（\(direction)）が利用できません。\n翻訳結果の代わりに元の文章を表示します。"
+        } else {
+            errorMessage = "翻訳準備エラー(\(direction)): \(nsErr.localizedDescription)"
+        }
+    }
+    #endif
+
+    // =============================
+    // 相手言語 → 日本語（常時ストリーミング）
+    // =============================
+    func startENContinuous() async {
+        guard !isENContinuousRunning else { return }
+
+        // ★ お試し切れなら開始させずサブスクへ誘導
+        guard trialStore.canUseTranslation else {
+            jaFromEN = "お試し回数（15回）を使い切りました。\nサブスクリプション画面から購入してください。"
+            return
+        }
+
+        do {
+            if !enAuthorized {
+                try await asrEN.requestAuthorization()
+                enAuthorized = true
+            }
+            try asrEN.startContinuous(onPartial: { [weak self] text in
+                guard let self else { return }
+                self.enLivePartial = text
+                self.scheduleQuickTranslateFromEN(fromFinal: false)
+            }, onFinal: { [weak self] text in
+                guard let self else { return }
+                self.enLiveFinal = text
+                self.scheduleQuickTranslateFromEN(fromFinal: true)
+            })
+            isENContinuousRunning = true
+        } catch {
+            errorMessage = "相手言語 常時認識開始エラー: \(error.localizedDescription)"
+        }
+    }
+
+    private func pauseENContinuous() {
+        asrEN.pause()
+        isENContinuousRunning = false
+    }
+
+    private func stopENContinuousCompletely() {
+        asrEN.cancelAll()
+        isENContinuousRunning = false
+    }
+
+    private func resumeENContinuous() {
+        asrEN.resume(onPartial: { [weak self] text in
+            guard let self else { return }
+            self.enLivePartial = text
+            self.scheduleQuickTranslateFromEN(fromFinal: false)
+        }, onFinal: { [weak self] text in
+            guard let self else { return }
+            self.enLiveFinal = text
+            self.scheduleQuickTranslateFromEN(fromFinal: true)
+        })
+        isENContinuousRunning = true
+    }
+
+    private func scheduleQuickTranslateFromEN(fromFinal: Bool) {
+        // ★ trial切れなら翻訳しない（ASR表示だけでもOK）
+        guard trialStore.canUseTranslation else {
+            jaFromEN = "お試し回数（15回）を使い切りました。\nサブスクリプション画面から購入してください。"
+            return
+        }
+
+        let source = fromFinal ? enLiveFinal : (enLiveFinal.isEmpty ? enLivePartial : enLiveFinal)
+        guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+        enDebounceTask?.cancel()
+        enDebounceTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            if Task.isCancelled { return }
+            await self.translateENtoJA(sourceEN: source, fromFinal: fromFinal)
+        }
+    }
+
+    private func translateENtoJA(sourceEN: String, fromFinal: Bool) async {
+        #if canImport(Translation)
+        guard isSystemTranslationAvailable, let s = sessionENtoJA else {
+            jaFromEN = "(システム翻訳未対応のため原文を表示)\n\(sourceEN)"
+            appendConversationEntry(
+                speaker: "相手",
+                direction: "\(appConfig.partnerLangCode.uppercased())→JA",
+                sourceLabel: "相手言語（原文）",
+                targetLabel: "日本語（原文）",
+                sourceText: sourceEN,
+                targetText: jaFromEN
+            )
+            appendENtoJAStudyLine(jaFromEN)
+            return
+        }
+
+        // ★ カウントは「final確定」かつ「同一finalの重複消費を防ぐ」
+        if fromFinal && !trialStore.isUnlocked {
+            if sourceEN == lastCountedPartnerFinal {
+                // 同じfinalを何度も処理しない
+            } else {
+                // 消費できないならここで終了
+                guard trialStore.canUseTranslation else {
+                    jaFromEN = "お試し回数（15回）を使い切りました。\nサブスクリプション画面から購入してください。"
+                    return
+                }
+            }
+        }
+
+        do {
+            let res = try await s.translate(sourceEN)
+            if Task.isCancelled { return }
+            let translated = res.targetText
+            jaFromEN = translated
+
+            // ✅ 翻訳が成功した時だけ消費（finalのみ）
+            if fromFinal && !trialStore.isUnlocked {
+                if sourceEN != lastCountedPartnerFinal {
+                    guard trialStore.consumeOneIfNeeded() else {
+                        jaFromEN = "お試し回数（15回）を使い切りました。\nサブスクリプション画面から購入してください。"
+                        return
+                    }
+                    lastCountedPartnerFinal = sourceEN
+                }
+            }
+
+            appendConversationEntry(
+                speaker: "相手",
+                direction: "\(appConfig.partnerLangCode.uppercased())→JA",
+                sourceLabel: "相手言語",
+                targetLabel: "日本語",
+                sourceText: sourceEN,
+                targetText: translated
+            )
+            appendENtoJAStudyLine(translated)
+
+        } catch is CancellationError {
+            return
+        } catch {
+            let nsErr = error as NSError
+            if nsErr.domain == "TranslationErrorDomain" || nsErr.code == 4097 {
+                isSystemTranslationAvailable = false
+                errorMessage = "このデバイスではシステム翻訳（\(appConfig.partnerLangCode.uppercased())→JA）が利用できません。\n原文表示に切り替えます。"
+                jaFromEN = "(システム翻訳エラー: 原文を表示)\n\(sourceEN)"
+            } else {
+                errorMessage = "翻訳エラー(\(appConfig.partnerLangCode.uppercased())→JA): \(nsErr.localizedDescription)"
+            }
+
+            appendConversationEntry(
+                speaker: "相手",
+                direction: "\(appConfig.partnerLangCode.uppercased())→JA",
+                sourceLabel: "相手言語（原文）",
+                targetLabel: "日本語（原文）",
+                sourceText: sourceEN,
+                targetText: jaFromEN
+            )
+            appendENtoJAStudyLine(jaFromEN)
+        }
+        #else
+        jaFromEN = "(Translationフレームワーク未対応環境: \(appConfig.partnerLangCode.uppercased())→JA)"
+        appendConversationEntry(
+            speaker: "相手",
+            direction: "\(appConfig.partnerLangCode.uppercased())→JA",
+            sourceLabel: "相手言語",
+            targetLabel: "日本語",
+            sourceText: sourceEN,
+            targetText: jaFromEN
+        )
+        appendENtoJAStudyLine(jaFromEN)
+        #endif
+    }
+
+    // =============================
+    // 日本語 → 相手言語（押して話す）
+    // =============================
+    func startRecordingJA() async {
+        guard !isRecordingJA, !isTranslating else { return }
+        isRecordingJA = true
+
+        stopENContinuousCompletely()
+        tts.stopImmediately()
+
+        do {
+            jaTranslateTask?.cancel()
+            enFromJA = ""
+            errorMessage = nil
+
+            try await asrJA.requestAuthorization()
+            partialJA = ""; finalJA = ""
+            try asrJA.startContinuous(onPartial: { [weak self] text in
+                self?.partialJA = text
+            }, onFinal: { [weak self] text in
+                self?.finalJA = text
+            })
+
+            try? await Task.sleep(nanoseconds: 120_000_000) // プリウォーム
+        } catch {
+            isRecordingJA = false
+            errorMessage = "録音開始エラー(JA): \(error.localizedDescription)"
+        }
+    }
+
+    func finishAndTranslateJA() {
+        asrJA.finishInput()
+        isRecordingJA = false
+
+        jaTranslateTask?.cancel()
+        jaTranslateTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            let deadline = Date().addingTimeInterval(1.0)
+            while Date() < deadline && self.finalJA.isEmpty && !self.asrJA.didEmitFinal {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if Task.isCancelled { return }
+            }
+            if self.finalJA.isEmpty { self.finalJA = self.partialJA }
+
+            self.asrJA.cancelAll()
+
+            await self.runTranslationAndTTS_JAtoEN()
+        }
+    }
+
+    private func runTranslationAndTTS_JAtoEN() async {
+        guard !finalJA.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        isTranslating = true
+        defer { isTranslating = false }
+
+        // ★ お試し切れなら翻訳しない
+        guard trialStore.canUseTranslation else {
+            errorMessage = "お試し回数（15回）を使い切りました。サブスクリプション画面から購入してください。"
+            return
+        }
+
+        #if canImport(Translation)
+        guard isSystemTranslationAvailable, let s = sessionJAtoEN else {
+            enFromJA = "(システム翻訳未対応のため原文を表示)\n\(finalJA)"
+            appendConversationEntry(
+                speaker: "自分",
+                direction: "JA→\(appConfig.partnerLangCode.uppercased())",
+                sourceLabel: "日本語（原文）",
+                targetLabel: "相手言語（原文）",
+                sourceText: finalJA,
+                targetText: enFromJA
+            )
+            return
+        }
+
+        do {
+            let res = try await s.translate(finalJA)
+            if Task.isCancelled { return }
+            let translated = res.targetText
+            enFromJA = translated
+
+            // ✅ 翻訳成功時だけカウント消費（finalのみ、同一final重複消費防止）
+            if !trialStore.isUnlocked {
+                if finalJA != lastCountedJAFinal {
+                    guard trialStore.consumeOneIfNeeded() else {
+                        errorMessage = "お試し回数（15回）を使い切りました。サブスクリプション画面から購入してください。"
+                        return
+                    }
+                    lastCountedJAFinal = finalJA
+                }
+            }
+
+            appendConversationEntry(
+                speaker: "自分",
+                direction: "JA→\(appConfig.partnerLangCode.uppercased())",
+                sourceLabel: "日本語",
+                targetLabel: "相手言語",
+                sourceText: finalJA,
+                targetText: translated
+            )
+
+            tts.speakEnglish(translated)
+        } catch is CancellationError {
+            return
+        } catch {
+            let nsErr = error as NSError
+            if nsErr.domain == "TranslationErrorDomain" || nsErr.code == 4097 {
+                isSystemTranslationAvailable = false
+                errorMessage = "このデバイスではシステム翻訳（JA→\(appConfig.partnerLangCode.uppercased())）が利用できません。\n原文表示に切り替えます。"
+                enFromJA = "(システム翻訳エラー: 原文を表示)\n\(finalJA)"
+            } else {
+                errorMessage = "翻訳エラー(JA→\(appConfig.partnerLangCode.uppercased())): \(nsErr.localizedDescription)"
+                enFromJA = "(翻訳エラー)\n\(finalJA)"
+            }
+
+            appendConversationEntry(
+                speaker: "自分",
+                direction: "JA→\(appConfig.partnerLangCode.uppercased())",
+                sourceLabel: "日本語（原文）",
+                targetLabel: "相手言語（原文）",
+                sourceText: finalJA,
+                targetText: enFromJA
+            )
+        }
+        #else
+        enFromJA = "(Translationフレームワーク未対応環境: JA→\(appConfig.partnerLangCode.uppercased()))"
+        appendConversationEntry(
+            speaker: "自分",
+            direction: "JA→\(appConfig.partnerLangCode.uppercased())",
+            sourceLabel: "日本語",
+            targetLabel: "相手言語",
+            sourceText: finalJA,
+            targetText: enFromJA
+        )
+        #endif
+    }
+
+    // MARK: - ログ保存関連
+
+    func forceFlushLogNow() {
+        flushCurrentLogToFile()
+    }
+
+    func deleteLog(_ log: ConversationLog) {
+        let fm = FileManager.default
+        let trashDir = trashDirectory()
+        let destURL = trashDir.appendingPathComponent(log.url.lastPathComponent)
+
+        do {
+            if fm.fileExists(atPath: destURL.path) {
+                try? fm.removeItem(at: destURL)
+            }
+            try fm.moveItem(at: log.url, to: destURL)
+
+            savedLogs.removeAll { $0.id == log.id || $0.url == log.url }
+
+            let attrs = try? fm.attributesOfItem(atPath: destURL.path)
+            let cdate = (attrs?[.creationDate] as? Date) ?? log.createdAt
+            let trashed = ConversationLog(id: UUID(), url: destURL, createdAt: cdate)
+            trashedLogs.insert(trashed, at: 0)
+        } catch {
+            errorMessage = "ゴミ箱移動エラー: \(error.localizedDescription)"
+        }
+    }
+
+    func restoreFromTrash(_ log: ConversationLog) {
+        let fm = FileManager.default
+        let destURL = logsDirectory().appendingPathComponent(log.url.lastPathComponent)
+
+        do {
+            if fm.fileExists(atPath: destURL.path) {
+                try? fm.removeItem(at: destURL)
+            }
+            try fm.moveItem(at: log.url, to: destURL)
+
+            trashedLogs.removeAll { $0.id == log.id || $0.url == log.url }
+
+            let attrs = try? fm.attributesOfItem(atPath: destURL.path)
+            let cdate = (attrs?[.creationDate] as? Date) ?? log.createdAt
+            let restored = ConversationLog(id: UUID(), url: destURL, createdAt: cdate)
+            savedLogs.insert(restored, at: 0)
+        } catch {
+            errorMessage = "復元エラー: \(error.localizedDescription)"
+        }
+    }
+
+    func permanentlyDelete(_ log: ConversationLog) {
+        do {
+            try FileManager.default.removeItem(at: log.url)
+        } catch {
+            errorMessage = "完全削除エラー: \(error.localizedDescription)"
+        }
+        trashedLogs.removeAll { $0.id == log.id || $0.url == log.url }
+    }
+
+    func readLog(_ log: ConversationLog) -> String {
+        (try? String(contentsOf: log.url, encoding: .utf8)) ?? ""
+    }
+
+    private func logsDirectory() -> URL {
+        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dir = base.appendingPathComponent(appConfig.logsFolderName, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    private func trashDirectory() -> URL {
+        let dir = logsDirectory().appendingPathComponent("Trash", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    private func loadExistingLogs() {
+        let fm = FileManager.default
+
+        let dir = logsDirectory()
+        var list: [ConversationLog] = []
+        if let urls = try? fm.contentsOfDirectory(at: dir,
+                                                  includingPropertiesForKeys: [.creationDateKey],
+                                                  options: [.skipsHiddenFiles]) {
+            for url in urls where url.pathExtension == "txt" {
+                if url.lastPathComponent == "Trash" { continue }
+                let attrs = try? fm.attributesOfItem(atPath: url.path)
+                let cdate = (attrs?[.creationDate] as? Date) ?? Date()
+                let log = ConversationLog(id: UUID(), url: url, createdAt: cdate)
+                list.append(log)
+            }
+        }
+        list.sort { $0.createdAt > $1.createdAt }
+        savedLogs = list
+
+        let trashDir = trashDirectory()
+        var tlist: [ConversationLog] = []
+        if let urls = try? fm.contentsOfDirectory(at: trashDir,
+                                                  includingPropertiesForKeys: [.creationDateKey],
+                                                  options: [.skipsHiddenFiles]) {
+            for url in urls where url.pathExtension == "txt" {
+                let attrs = try? fm.attributesOfItem(atPath: url.path)
+                let cdate = (attrs?[.creationDate] as? Date) ?? Date()
+                let log = ConversationLog(id: UUID(), url: url, createdAt: cdate)
+                tlist.append(log)
+            }
+        }
+        tlist.sort { $0.createdAt > $1.createdAt }
+        trashedLogs = tlist
+    }
+
+    private func appendConversationEntry(
+        speaker: String,
+        direction: String,
+        sourceLabel: String,
+        targetLabel: String,
+        sourceText: String,
+        targetText: String
+    ) {
+        guard isLoggingEnabled else { return }
+
+        let now = Date()
+
+        if let start = currentLogStartDate,
+           now.timeIntervalSince(start) > 5 * 60 {
+            flushCurrentLogToFile()
+        }
+
+        if currentLogStartDate == nil {
+            currentLogStartDate = now
+            currentLogBuffer = ""
+            enToJaOnlyBuffer = ""
+        }
+
+        let timeStr = Self.logTimeFormatter.string(from: now)
+
+        let entry = """
+        [\(timeStr)] \(speaker) (\(direction))
+        \(sourceLabel): \(sourceText)
+        \(targetLabel): \(targetText)
+
+        """
+
+        currentLogBuffer.append(entry)
+    }
+
+    private func appendENtoJAStudyLine(_ jaText: String) {
+        guard isLoggingEnabled else { return }
+
+        if enToJaOnlyBuffer.isEmpty {
+            enToJaOnlyBuffer.append("【相手言語→日本語 翻訳ログ】\n\n")
+        }
+        enToJaOnlyBuffer.append(jaText)
+        enToJaOnlyBuffer.append("\n")
+    }
+
+    private func flushCurrentLogToFile() {
+        guard let start = currentLogStartDate else {
+            currentLogStartDate = nil
+            currentLogBuffer = ""
+            enToJaOnlyBuffer = ""
+            return
+        }
+
+        let dir = logsDirectory()
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "ja_JP")
+        df.dateFormat = "yyyyMMdd_HHmmss"
+
+        do {
+            if !currentLogBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let name = "\(appConfig.logFilePrefix)_\(df.string(from: start)).txt"
+                let url = dir.appendingPathComponent(name)
+                try currentLogBuffer.write(to: url, atomically: true, encoding: .utf8)
+                let log = ConversationLog(id: UUID(), url: url, createdAt: start)
+                savedLogs.insert(log, at: 0)
+            }
+
+            if !enToJaOnlyBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let nameJA = "\(appConfig.viToJaLogFilePrefix)_\(df.string(from: start)).txt"
+                let urlJA = dir.appendingPathComponent(nameJA)
+                try enToJaOnlyBuffer.write(to: urlJA, atomically: true, encoding: .utf8)
+                let logJA = ConversationLog(id: UUID(), url: urlJA, createdAt: start)
+                savedLogs.insert(logJA, at: 0)
+            }
+        } catch {
+            errorMessage = "ログ保存エラー: \(error.localizedDescription)"
+        }
+
+        currentLogStartDate = nil
+        currentLogBuffer = ""
+        enToJaOnlyBuffer = ""
+    }
+}
+
+// =====================================
+// ゴミ箱イラスト View
+// =====================================
+struct TrashCanIllustrationView: View {
+    let count: Int
+    let isOpen: Bool
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(.secondarySystemBackground))
+                .frame(width: 80, height: 80)
+                .shadow(radius: 2, y: 1)
+
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color(.systemGray3), lineWidth: 1.5)
+                .frame(width: 80, height: 80)
+
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(.systemGray3))
+                .frame(width: 64, height: 10)
+                .offset(y: isOpen ? -62 : -42)
+                .rotationEffect(
+                    isOpen ? .degrees(-55) : .degrees(0),
+                    anchor: .bottomLeading
+                )
+                .shadow(radius: isOpen ? 2 : 0, y: 1)
+
+            VStack(spacing: 3) {
+                Spacer()
+                Image(systemName: count > 0 ? "folder.fill" : "folder")
+                    .font(.system(size: 20, weight: .semibold))
+                Text(count > 0 ? "\(count) 件" : "空")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.vertical, 10)
+        }
+        .frame(width: 90, height: 90)
+        .overlay(
+            Text("ゴミ箱")
+                .font(.caption2)
+                .padding(.top, 76),
+            alignment: .top
+        )
+    }
+}
+
+// =====================================
+// 汎用：左にスライドしてアクションする行
+// =====================================
+struct SwipeActionRow<Content: View>: View {
+    let actionLabel: String
+    let systemImage: String
+    let onAction: () -> Void
+    let content: () -> Content
+
+    @State private var offsetX: CGFloat = 0
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            HStack {
+                Spacer()
+                HStack(spacing: 6) {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 14, weight: .semibold))
+                    Text(actionLabel)
+                        .font(.caption)
+                }
+                .foregroundColor(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.red)
+                .clipShape(Capsule())
+                .padding(.trailing, 16)
+            }
+
+            content()
+                .background(Color.clear)
+                .offset(x: offsetX)
+                .gesture(
+                    DragGesture(minimumDistance: 10, coordinateSpace: .local)
+                        .onChanged { value in
+                            if value.translation.width < 0 {
+                                offsetX = value.translation.width
+                            }
+                        }
+                        .onEnded { value in
+                            if value.translation.width < -80 {
+                                withAnimation(.easeOut(duration: 0.12)) {
+                                    offsetX = -120
+                                }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                                    onAction()
+                                    offsetX = 0
+                                }
+                            } else {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    offsetX = 0
+                                }
+                            }
+                        }
+                )
+        }
+    }
+}
+
+// =====================================
+// 起動スプラッシュ用 View（約10秒バージョン）
+// =====================================
+struct LaunchSplashView: View {
+    @Binding var showSplash: Bool
+
+    @State private var scale: CGFloat = 0.4
+    @State private var opacity: Double = 0.0
+
+    var body: some View {
+        ZStack {
+            Color(.systemBackground)
+                .ignoresSafeArea()
+
+            Image("LaunchIcon")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 180, height: 180)
+                .scaleEffect(scale)
+                .opacity(opacity)
+        }
+        .onAppear {
+            withAnimation(.easeOut(duration: 2.5)) {
+                opacity = 1.0
+                scale = 1.0
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                withAnimation(.easeInOut(duration: 5.0)) {
+                    scale = 3.2
+                    opacity = 0.0
+                }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 9.8) {
+                showSplash = false
+            }
+        }
+    }
+}
+
+// =====================================
+// UI
+// =====================================
+struct ContentView: View {
+    @StateObject private var vm: DoujituVM
+    private let trialStore: TrialUsageStore
+
+    init(trialStore: TrialUsageStore) {
+        self.trialStore = trialStore
+        _vm = StateObject(wrappedValue: DoujituVM(trialStore: trialStore))
+    }
+
+    @State private var dragJA: CGSize = .zero
+
+    @State private var selectedLog: ConversationLog?
+    @State private var selectedLogText: String = ""
+
+    @State private var isTrashOpen: Bool = false
+    @State private var showSplash: Bool = true
+
+    // Guideline 4.2.3 対応用
+    @State private var showResourceAlert: Bool = false
+    @State private var resourceDownloadAllowed: Bool = false
+
+    private let knobMaxRadius: CGFloat = 56
+    private let outerSize: CGFloat = 112
+    private let innerSize: CGFloat = 60
+
+    var body: some View {
+        ZStack {
+            ScrollView {
+                VStack(spacing: 6) {
+
+                    // ==== ロゴ ====
+                    Group {
+                        VStack(spacing: 6) {
+                            Text(appConfig.appDisplayName)
+                                .font(.system(size: 22, weight: .heavy, design: .rounded))
+                                .tracking(1.5)
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 6)
+                                .background(
+                                    Capsule().fill(
+                                        LinearGradient(
+                                            colors: [
+                                                Color.pink.opacity(0.9),
+                                                Color.orange.opacity(0.9)
+                                            ],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                    )
+                                )
+                                .foregroundColor(.white)
+
+                            if !trialStore.isUnlocked {
+                                Text("お試し：残り \(trialStore.remaining) 回（合計15回）")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+
+                    // ★ 追加リソース未許可時の案内（Guideline 4.2.3）
+                    if !resourceDownloadAllowed {
+                        VStack(spacing: 6) {
+                            Text("翻訳用の追加データについて")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Text("このアプリの翻訳機能を利用するには、Apple のサーバから翻訳用の追加データ（約 150MB）がダウンロードされる場合があります。Wi-Fi 環境でのダウンロードをおすすめします。")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Button {
+                                showResourceAlert = true
+                            } label: {
+                                Text("翻訳データをダウンロードして開始")
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background(Color.blue)
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
+                            }
+                        }
+                        .padding(12)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color(.secondarySystemBackground))
+                        )
+                        .padding(.horizontal, 12)
+                    }
+
+                    // ==== 相手言語 → 日本語 ====
+                    Group {
+                        VStack(spacing: 4) {
+                            Text("ヒンディー語 → 日本語（常時ストリーミング）")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            LabeledContent("ヒンディー語（途中）") {
+                                Text(vm.enLivePartial.isEmpty ? "…" : vm.enLivePartial)
+                                    .multilineTextAlignment(.leading)
+                                    .lineLimit(2)
+                                    .truncationMode(.tail)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+
+                            LabeledContent("日本語\n（自動翻訳結果）") {
+                                ScrollView {
+                                    Text(vm.jaFromEN.isEmpty ? "…" : vm.jaFromEN)
+                                        .multilineTextAlignment(.leading)
+                                        .textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(8)
+                                }
+                                .frame(minHeight: 280, maxHeight: 560)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .fill(Color(.secondarySystemBackground))
+                                )
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+
+                    Divider().padding(.vertical, 4)
+
+                    // ==== 日本語 → 相手言語 ====
+                    Group {
+                        VStack(spacing: 4) {
+                            Text("日本語 → ヒンディー語（押して話す／離すと翻訳＋音声）")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            LabeledContent("日本語（途中）") {
+                                Text(vm.partialJA.isEmpty ? "…" : vm.partialJA)
+                                    .multilineTextAlignment(.leading)
+                                    .lineLimit(2)
+                                    .truncationMode(.tail)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+
+                            LabeledContent("ヒンディー語（翻訳結果）") {
+                                Text(vm.enFromJA.isEmpty ? "…" : vm.enFromJA)
+                                    .multilineTextAlignment(.leading)
+                                    .foregroundStyle(.blue)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(minHeight: 60, alignment: .topLeading)
+                            }
+
+                            // PTTノブ
+                            ZStack {
+                                Circle()
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [Color.pink.opacity(0.9), Color.orange.opacity(0.9)],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                    )
+                                    .frame(width: outerSize, height: outerSize)
+                                    .shadow(radius: 4, y: 2)
+                                    .overlay(
+                                        VStack {
+                                            Spacer()
+                                            Text(vm.isRecordingJA ? "録音中… 離すと翻訳" : "指で押しながら話す")
+                                                .font(.caption2)
+                                                .foregroundStyle(.white)
+                                                .padding(.bottom, 8)
+                                                .lineLimit(2)
+                                        }
+                                    )
+
+                                Circle()
+                                    .fill(.ultraThinMaterial)
+                                    .overlay(
+                                        Image(systemName: vm.isRecordingJA ? "waveform" : "mic.fill")
+                                            .font(.system(size: 24, weight: .semibold))
+                                            .foregroundStyle(vm.isRecordingJA ? .red : .primary)
+                                    )
+                                    .frame(width: innerSize, height: innerSize)
+                                    .offset(dragJA)
+                                    .gesture(
+                                        DragGesture(minimumDistance: 0)
+                                            .onChanged { value in
+                                                if !vm.isRecordingJA && !vm.isTranslating {
+                                                    Task {
+                                                        await vm.startRecordingJA()
+                                                    }
+                                                }
+                                                let dx = value.translation.width
+                                                let dy = value.translation.height
+                                                let r = sqrt(dx*dx + dy*dy)
+                                                if r <= knobMaxRadius {
+                                                    dragJA = value.translation
+                                                } else {
+                                                    let s = knobMaxRadius / max(r, 0.0001)
+                                                    dragJA = CGSize(width: dx*s, height: dy*s)
+                                                }
+                                            }
+                                            .onEnded { _ in
+                                                withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
+                                                    dragJA = .zero
+                                                }
+                                                vm.finishAndTranslateJA()
+                                            }
+                                    )
+                            }
+                            .padding(.bottom, 4)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+
+                    if let err = vm.errorMessage, !err.isEmpty {
+                        Text(err)
+                            .foregroundStyle(.red)
+                            .font(.footnote)
+                            .padding(.horizontal)
+                    }
+
+                    Divider().padding(.vertical, 4)
+
+                    // ==== 会話ログ ====
+                    Group {
+                        VStack(spacing: 4) {
+                            HStack {
+                                Text("会話ログ（約5分ごとに自動保存）")
+                                    .font(.headline)
+                                Spacer()
+                                Toggle(isOn: $vm.isLoggingEnabled) {
+                                    Text(vm.isLoggingEnabled ? "ON" : "OFF")
+                                        .font(.caption)
+                                }
+                                .labelsHidden()
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Button {
+                                vm.forceFlushLogNow()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "square.and.arrow.down")
+                                    Text("現在までを1つのログとして保存")
+                                        .font(.caption)
+                                }
+                            }
+
+                            if vm.savedLogs.isEmpty {
+                                Text("まだ保存されたログはありません。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            } else {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    ForEach(vm.savedLogs) { log in
+                                        SwipeActionRow(
+                                            actionLabel: "ゴミ箱へ",
+                                            systemImage: "trash"
+                                        ) {
+                                            vm.deleteLog(log)
+                                        } content: {
+                                            HStack(alignment: .top, spacing: 8) {
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(log.displayName)
+                                                        .font(.subheadline)
+                                                    Text(log.formattedDate)
+                                                        .font(.caption2)
+                                                        .foregroundStyle(.secondary)
+                                                }
+
+                                                Spacer()
+
+                                                Button {
+                                                    selectedLogText = vm.readLog(log)
+                                                    selectedLog = log
+                                                } label: {
+                                                    VStack(spacing: 2) {
+                                                        Image(systemName: "doc.text.magnifyingglass")
+                                                            .font(.system(size: 16, weight: .semibold))
+                                                        Text("開く")
+                                                            .font(.caption2)
+                                                    }
+                                                    .padding(6)
+                                                }
+
+                                                if #available(iOS 16.0, *) {
+                                                    ShareLink(item: log.url) {
+                                                        VStack(spacing: 2) {
+                                                            Image(systemName: "square.and.arrow.up")
+                                                                .font(.system(size: 16, weight: .semibold))
+                                                            Text("共有")
+                                                                .font(.caption2)
+                                                        }
+                                                        .padding(6)
+                                                    }
+                                                }
+                                            }
+                                            .padding(4)
+                                            .background(
+                                                RoundedRectangle(cornerRadius: 8)
+                                                    .fill(Color(.secondarySystemBackground))
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            Divider().padding(.vertical, 2)
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text("ゴミ箱")
+                                        .font(.headline)
+                                    Spacer()
+                                }
+
+                                Button {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                                        isTrashOpen.toggle()
+                                    }
+                                } label: {
+                                    HStack {
+                                        Spacer()
+                                        TrashCanIllustrationView(
+                                            count: vm.trashedLogs.count,
+                                            isOpen: isTrashOpen
+                                        )
+                                        Spacer()
+                                    }
+                                }
+                                .buttonStyle(.plain)
+
+                                if isTrashOpen && !vm.trashedLogs.isEmpty {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        ForEach(vm.trashedLogs) { log in
+                                            SwipeActionRow(
+                                                actionLabel: "完全削除",
+                                                systemImage: "trash.slash"
+                                            ) {
+                                                vm.permanentlyDelete(log)
+                                            } content: {
+                                                HStack(alignment: .top, spacing: 8) {
+                                                    VStack(alignment: .leading, spacing: 2) {
+                                                        Text(log.displayName)
+                                                            .font(.subheadline)
+                                                        Text(log.formattedDate)
+                                                            .font(.caption2)
+                                                            .foregroundStyle(.secondary)
+                                                    }
+
+                                                    Spacer()
+
+                                                    Button {
+                                                        selectedLogText = vm.readLog(log)
+                                                        selectedLog = log
+                                                    } label: {
+                                                        VStack(spacing: 2) {
+                                                            Image(systemName: "doc.text.magnifyingglass")
+                                                                .font(.system(size: 16, weight: .semibold))
+                                                            Text("開く")
+                                                                .font(.caption2)
+                                                        }
+                                                        .padding(6)
+                                                    }
+
+                                                    Button {
+                                                        vm.restoreFromTrash(log)
+                                                    } label: {
+                                                        VStack(spacing: 2) {
+                                                            Image(systemName: "arrow.uturn.backward")
+                                                                .font(.system(size: 16, weight: .semibold))
+                                                            Text("復元")
+                                                                .font(.caption2)
+                                                        }
+                                                        .padding(6)
+                                                    }
+                                                }
+                                                .padding(4)
+                                                .background(
+                                                    RoundedRectangle(cornerRadius: 8)
+                                                        .fill(Color(.tertiarySystemBackground))
+                                                )
+                                            }
+                                        }
+                                    }
+                                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                                } else if vm.trashedLogs.isEmpty {
+                                    Text("ゴミ箱は空です。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.top, 300)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 16)
+                }
+                .padding(.top, 12)
+            }
+
+            if showSplash {
+                LaunchSplashView(showSplash: $showSplash)
+                    .transition(.opacity)
+                    .zIndex(10)
+            }
+        }
+        .onAppear {
+            // 追加データ同意の状態をロード
+            let consent = UserDefaults.standard.bool(forKey: appConfig.resourceConsentUserDefaultsKey)
+            resourceDownloadAllowed = consent
+            if !consent {
+                showResourceAlert = true
+            }
+        }
+        .alert("追加データのダウンロード", isPresented: $showResourceAlert) {
+            Button("キャンセル", role: .cancel) {
+                resourceDownloadAllowed = false
+                UserDefaults.standard.set(false, forKey: appConfig.resourceConsentUserDefaultsKey)
+            }
+            Button("ダウンロード") {
+                resourceDownloadAllowed = true
+                UserDefaults.standard.set(true, forKey: appConfig.resourceConsentUserDefaultsKey)
+                vm.enableTranslationTasks()
+                Task {
+                    await vm.startENContinuous()
+                }
+            }
+        } message: {
+            Text("このアプリの翻訳機能を利用するには、Apple のサーバから翻訳用の追加データ（約 150MB）がダウンロードされる場合があります。Wi-Fi 環境でのダウンロードをおすすめします。今すぐダウンロードしますか？")
+        }
+        .task {
+            if resourceDownloadAllowed {
+                vm.enableTranslationTasks()
+                await vm.startENContinuous()
+            }
+        }
+        .sheet(item: $selectedLog) { log in
+            NavigationStack {
+                ScrollView {
+                    Text(selectedLogText.isEmpty ? "（内容なし）" : selectedLogText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                }
+                .navigationTitle(log.displayName)
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("閉じる") { selectedLog = nil }
+                    }
+                }
+            }
+        }
+        #if canImport(Translation)
+        .translationTask(vm.tConfigJAtoEN) { session in
+            await vm.bindSessionJAtoEN(session)
+        }
+        .translationTask(vm.tConfigENtoJA) { session in
+            await vm.bindSessionENtoJA(session)
+        }
+        #endif
+    }
+}
